@@ -1,15 +1,21 @@
 # =========================
-# MULTI-SESSION STRATEGY (PRO)
+# MULTI-SESSION STRATEGY (PRO) + DERIV SYNTHETICS ADD-ON
 # ASIA: Range Bounce
 # LONDON: Trend Continuation (EMA state + pullback)
-# NEWYORK: Reversal (strict PA) + SAFE LOOSENING (Option 1)
+# NEWYORK: Reversal (strict PA) + SAFE LOOSENING
 #
 # ✅ UPDATED:
-# - Signal timeframe can stay H1 (your main.py controls this)
-# - Bias can be Dual Bias:
+# - Signal timeframe is controlled by main.py (default H1 in your snapshot mode)
+# - Dual Bias:
 #    Primary: H4
 #    Confirm: H1
 #    Trade allowed only if H4 bias == H1 bias (both stable)
+#
+# ✅ NEW (DERIV SYNTHETICS):
+# - Base aliases you will use: STEP, V10, V75
+# - Broker symbols (exact): Step Index, Volatility 10 Index, Volatility 75 Index
+# - Strategy for synthetics: Trend Following + SMC (BOS + Pullback to OB zone)
+# - Synthetics ignore session gating (can trade 24/7)
 # =========================
 
 import MetaTrader5 as mt5
@@ -24,12 +30,25 @@ SLOW_EMA = 40
 VOL_LOOKBACK = 20
 VOL_MULTIPLIER = 0.60
 
+# ✅ Deriv broker symbols (exact)
+DERIV_BROKER_SYMBOLS = {
+    "Step Index",
+    "Volatility 10 Index",
+    "Volatility 75 Index",
+}
+
+# Support/Resistance threshold (relative)
 SR_THRESH = {
     "EURUSD": 0.0015,
     "USDJPY": 0.0015,
     "GBPJPY": 0.0018,
     "XAUUSD": 0.0025,
     "BTCUSD": 0.0060,
+
+    # Deriv synthetics (more tolerance because they move differently)
+    "Step Index": 0.0040,
+    "Volatility 10 Index": 0.0045,
+    "Volatility 75 Index": 0.0060,
 }
 
 TF_NAMES = {
@@ -67,10 +86,10 @@ def is_bullish_engulfing(df):
     last = df.iloc[-1]
     prev = df.iloc[-2]
     return (
-        last["close"] > last["open"]
-        and prev["close"] < prev["open"]
-        and last["close"] > prev["open"]
-        and last["open"] < prev["close"]
+            last["close"] > last["open"]
+            and prev["close"] < prev["open"]
+            and last["close"] > prev["open"]
+            and last["open"] < prev["close"]
     )
 
 
@@ -78,10 +97,10 @@ def is_bearish_engulfing(df):
     last = df.iloc[-1]
     prev = df.iloc[-2]
     return (
-        last["close"] < last["open"]
-        and prev["close"] > prev["open"]
-        and last["open"] > prev["close"]
-        and last["close"] < prev["open"]
+            last["close"] < last["open"]
+            and prev["close"] > prev["open"]
+            and last["open"] > prev["close"]
+            and last["close"] < prev["open"]
     )
 
 
@@ -121,6 +140,10 @@ def near_resistance(symbol, price, resistance):
 
 # ------------------- VOLUME FILTER -------------------
 def sufficient_volume(df, symbol=None, session=None):
+    # Synthetics: tick_volume behavior differs; don't block on volume (too many false blocks)
+    if symbol in DERIV_BROKER_SYMBOLS:
+        return True
+
     v = df["tick_volume"]
     if len(v) < VOL_LOOKBACK + 2:
         return True
@@ -205,7 +228,7 @@ def london_trend(symbol, df):
 
 
 # =========================
-# NEW YORK: REVERSAL (Option 1 safe loosening)
+# NEW YORK: REVERSAL
 # =========================
 def newyork_reversal(symbol, df):
     if not sufficient_volume(df, symbol, session="NEWYORK"):
@@ -237,17 +260,127 @@ def newyork_reversal(symbol, df):
     return signal
 
 
-# ------------------- MASTER SIGNAL -------------------
-def get_signal(symbol, timeframe=mt5.TIMEFRAME_M30):
-    session = get_current_session()
-    if session is None:
+# =========================
+# DERIV: TREND FOLLOWING + SMC (BOS + OB PULLBACK)
+# =========================
+def _ema_trend(df):
+    df["ema_fast"] = df["close"].ewm(span=FAST_EMA).mean()
+    df["ema_slow"] = df["close"].ewm(span=SLOW_EMA).mean()
+    fast = df["ema_fast"].iloc[-2]  # closed candle
+    slow = df["ema_slow"].iloc[-2]
+    if fast > slow:
+        return "BULL"
+    if fast < slow:
+        return "BEAR"
+    return None
+
+
+def _swing_high_low(df, lookback=20):
+    recent = df.tail(lookback)
+    swing_high = float(recent["high"].max())
+    swing_low = float(recent["low"].min())
+    return swing_high, swing_low
+
+
+def _last_opposite_candle_zone(df, direction: str, max_lookback=12):
+    """
+    Approx Order Block zone:
+    - For BUY: last bearish candle before BOS (open/close range)
+    - For SELL: last bullish candle before BOS
+    Returns (zone_low, zone_high) or (None, None)
+    """
+    direction = str(direction).upper().strip()
+    if len(df) < max_lookback + 5:
+        return None, None
+
+    # Scan backwards on CLOSED candles only
+    for i in range(3, 3 + max_lookback):
+        c = df.iloc[-i]
+        is_bull = float(c["close"]) > float(c["open"])
+        is_bear = float(c["close"]) < float(c["open"])
+
+        if direction == "BUY" and is_bear:
+            lo = float(min(c["open"], c["close"]))
+            hi = float(max(c["open"], c["close"]))
+            return lo, hi
+
+        if direction == "SELL" and is_bull:
+            lo = float(min(c["open"], c["close"]))
+            hi = float(max(c["open"], c["close"]))
+            return lo, hi
+
+    return None, None
+
+
+def deriv_trend_smc_signal(symbol, df):
+    """
+    SMC-like rules (simple, stable):
+    1) Trend filter via EMA (fast vs slow)
+    2) BOS confirmation: close breaks swing high/low
+    3) Entry: price is pulling back into the last opposite candle zone (OB proxy)
+       + mild rejection / PA confirmation
+    """
+    trend = _ema_trend(df)
+    if trend is None:
         return None
 
-    df = get_data(symbol, timeframe=timeframe, bars=300)
-    if df is None or len(df) < 120:
+    # BOS on last closed candle
+    last_closed = df.iloc[-2]
+    close = float(last_closed["close"])
+
+    swing_high, swing_low = _swing_high_low(df, lookback=20)
+
+    bos_up = close > swing_high
+    bos_down = close < swing_low
+
+    if trend == "BULL" and not bos_up:
+        return None
+    if trend == "BEAR" and not bos_down:
+        return None
+
+    direction = "BUY" if trend == "BULL" else "SELL"
+
+    # OB zone from last opposite candle
+    zlo, zhi = _last_opposite_candle_zone(df, direction=direction, max_lookback=12)
+    if zlo is None or zhi is None:
+        return None
+
+    # Current price from last candle (can be forming) for pullback check
+    cur_price = float(df["close"].iloc[-1])
+
+    in_zone = (zlo <= cur_price <= zhi) or (zhi <= cur_price <= zlo)
+    if not in_zone:
+        return None
+
+    # Confirmation: PA / rejection around zone
+    pa_ok = is_simple_rejection(df) or (has_bullish_pa(df) if direction == "BUY" else has_bearish_pa(df))
+    if not pa_ok:
+        return None
+
+    return direction
+
+
+# ------------------- MASTER SIGNAL -------------------
+def get_signal(symbol, timeframe=mt5.TIMEFRAME_M30):
+    """
+    - FX/Crypto: session-gated signals (ASIAN/LONDON/NEWYORK)
+    - DERIV: ignores session and uses deriv_trend_smc_signal
+    """
+    df = get_data(symbol, timeframe=timeframe, bars=350)
+    if df is None or len(df) < 140:
         return None
 
     tf_name = TF_NAMES.get(timeframe, str(timeframe))
+
+    # ✅ DERIV path (24/7)
+    if symbol in DERIV_BROKER_SYMBOLS:
+        print(f"{symbol} -> DERIV Trend+SMC (BOS+OB pullback) [{tf_name}]")
+        return deriv_trend_smc_signal(symbol, df)
+
+    # ✅ Normal FX/Crypto session path
+    session = get_current_session()
+    if session is None:
+        return None
 
     if session == "ASIAN":
         print(f"{symbol} -> Asian range bounce (PA + S/R + vol) [{tf_name}]")
@@ -272,8 +405,8 @@ def get_bias(symbol, timeframe=mt5.TIMEFRAME_H1, stable_bars: int = 2):
     ✅ Stability rule:
     - Bias must be the SAME for the last `stable_bars` CLOSED candles.
     """
-    df = get_data(symbol, timeframe=timeframe, bars=300)
-    if df is None or len(df) < 120:
+    df = get_data(symbol, timeframe=timeframe, bars=350)
+    if df is None or len(df) < 140:
         return None
 
     df["ema_fast"] = df["close"].ewm(span=FAST_EMA).mean()
@@ -304,11 +437,11 @@ def get_bias(symbol, timeframe=mt5.TIMEFRAME_H1, stable_bars: int = 2):
 
 # ------------------- DUAL BIAS (H4 + H1 must agree) -------------------
 def get_dual_bias(
-    symbol,
-    primary_tf=mt5.TIMEFRAME_H4,
-    confirm_tf=mt5.TIMEFRAME_H1,
-    primary_stable: int = 2,
-    confirm_stable: int = 2,
+        symbol,
+        primary_tf=mt5.TIMEFRAME_H4,
+        confirm_tf=mt5.TIMEFRAME_H1,
+        primary_stable: int = 2,
+        confirm_stable: int = 2,
 ):
     """
     Returns:
@@ -317,9 +450,6 @@ def get_dual_bias(
     final_bias is:
       - "BULL" or "BEAR" if BOTH timeframes agree and both are stable
       - None otherwise
-
-    Example:
-      final, h4, h1 = get_dual_bias(symbol)
     """
     primary_bias = get_bias(symbol, timeframe=primary_tf, stable_bars=primary_stable)
     confirm_bias = get_bias(symbol, timeframe=confirm_tf, stable_bars=confirm_stable)

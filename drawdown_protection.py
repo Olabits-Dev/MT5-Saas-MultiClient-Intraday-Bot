@@ -1,78 +1,85 @@
+# drawdown_protection.py
+import json
+import os
+from datetime import datetime, timezone
 import MetaTrader5 as mt5
-from datetime import datetime
 
-# ---------------- SETTINGS ----------------
-MAX_DD = 5.0  # % daily max drawdown per client
-# -----------------------------------------
-
-# Store baselines per account login:
-# { login: {"start_equity": float, "day": int} }
-_STATE = {}
+DEFAULT_DD_LIMIT_PCT = 5.0  # fallback if client doesn't specify dd_limit_pct
+STATE_DIR = "dd_state"
 
 
-def _server_day():
+def _today_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _state_path(login: int) -> str:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    return os.path.join(STATE_DIR, f"dd_{int(login)}.json")
+
+
+def _load_state(login: int) -> dict:
+    path = _state_path(login)
+    if not os.path.exists(path):
+        return {"date": _today_utc(), "start_equity": None}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"date": _today_utc(), "start_equity": None}
+
+
+def _save_state(login: int, state: dict):
+    path = _state_path(login)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+
+def allowed(dd_limit_pct: float | None = None, login: int | None = None) -> bool:
     """
-    Use broker/server time by reading tick time from any common symbol.
-    Falls back to UTC day if tick is not available.
-    """
-    tick = mt5.symbol_info_tick("EURUSD")
-    if tick is None:
-        return datetime.utcnow().day
-    return datetime.fromtimestamp(tick.time).day
+    Returns True if client is allowed to trade today based on daily DD%.
 
+    dd_limit_pct:
+      - if None => DEFAULT_DD_LIMIT_PCT
+      - else uses given value (e.g., 0.5)
 
-def reset_day_for_current_account():
-    """
-    Reset daily baseline equity for the currently connected MT5 account.
-    """
-    acc = mt5.account_info()
-    if acc is None:
-        return False
-
-    login = int(acc.login)
-    _STATE[login] = {
-        "start_equity": float(acc.equity),
-        "day": _server_day(),
-    }
-
-    print(
-        f"🔄 DD reset | Client {login} | Start equity: {_STATE[login]['start_equity']:.2f} | MaxDD: {MAX_DD:.2f}%"
-    )
-    return True
-
-
-def allowed():
-    """
-    Per-client drawdown check for the CURRENT connected MT5 account.
-    Returns True if trading is allowed for that client today.
+    login:
+      - if None => tries account_info().login
     """
     acc = mt5.account_info()
     if acc is None:
+        # If MT5 is not connected, safest is to block trading
+        print("⚠️ DD: account_info() is None. Blocking trading for safety.")
         return False
 
-    login = int(acc.login)
-    today = _server_day()
+    login = int(login or acc.login)
+    dd_limit_pct = float(dd_limit_pct if dd_limit_pct is not None else DEFAULT_DD_LIMIT_PCT)
 
-    # Initialize/reset baseline if missing or new day
-    if login not in _STATE or _STATE[login].get("day") != today:
-        ok = reset_day_for_current_account()
-        if not ok:
-            return False
+    # sanity
+    if dd_limit_pct <= 0:
+        dd_limit_pct = 0.1  # never allow zero/negative
 
-    start_equity = float(_STATE[login]["start_equity"])
-    equity = float(acc.equity)
+    state = _load_state(login)
+    today = _today_utc()
 
-    # Extra safety guard
-    if start_equity <= 0:
-        reset_day_for_current_account()
-        start_equity = float(_STATE[login]["start_equity"])
+    equity_now = float(getattr(acc, "equity", 0.0) or 0.0)
+    if equity_now <= 0:
+        print("⚠️ DD: equity invalid. Blocking trading for safety.")
+        return False
 
-    dd = (start_equity - equity) / start_equity * 100.0
+    # Reset daily state if new day OR missing
+    if state.get("date") != today or not state.get("start_equity"):
+        state = {"date": today, "start_equity": equity_now}
+        _save_state(login, state)
+        print(f"🆕 DD: Reset daily start_equity={equity_now:.2f} for login={login}")
 
-    if dd >= MAX_DD:
-        print(
-            f"⛔ DAILY DD LIMIT HIT | Client {login} | DD: {dd:.2f}% (Max: {MAX_DD:.2f}%) — trading blocked today"
-        )
+    start_equity = float(state["start_equity"])
+    dd_pct = ((start_equity - equity_now) / start_equity) * 100.0
+
+    if dd_pct >= dd_limit_pct:
+        print(f"⛔ DD protection: login={login} DD={dd_pct:.2f}% >= limit={dd_limit_pct:.2f}%")
         return False
 
     return True

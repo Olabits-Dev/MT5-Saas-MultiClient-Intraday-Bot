@@ -3,7 +3,7 @@ import json
 import os
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 
 import MetaTrader5 as mt5
 from telegram import send_telegram
@@ -11,9 +11,14 @@ from telegram import send_telegram
 DEFAULT_MAGIC = 777777
 DEFAULT_DEVIATION = 20
 
-# ===== Profit Lock Rules =====
-TRIGGER_RR = 3.0   # when price reaches 1:3RR
-LOCK_RR = 2.0      # lock profit at 1:2RR
+# =========================================================
+# PROFIT LOCK RULES (UPDATED FOR RR=1:3 TP)
+# - Your TP is now 1:3
+# - So we trigger earlier and lock earlier:
+#   Trigger at 1:2R, Lock at 1:1R (safer)
+# =========================================================
+TRIGGER_RR = 2.0   # when price reaches 1:2RR
+LOCK_RR = 1.0      # lock profit at 1:1RR
 
 # Broker stop/freeze safety buffer
 STOP_BUFFER_POINTS = 10
@@ -111,15 +116,30 @@ def _respect_min_stop(symbol: str, pos_type: int, new_sl: float) -> Optional[flo
     digits = int(info.digits)
 
     if pos_type == mt5.POSITION_TYPE_BUY:
-        # SL must be <= price - min_dist
         max_sl = price - min_dist
         sl_adj = min(new_sl, max_sl)
     else:
-        # SL must be >= price + min_dist
         min_sl = price + min_dist
         sl_adj = max(new_sl, min_sl)
 
     return round(float(sl_adj), digits)
+
+
+def _order_send_sltp_with_fill_fallback(request: dict):
+    """
+    Some brokers care about filling type even on SLTP modify.
+    """
+    modes = [mt5.ORDER_FILLING_RETURN, mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK]
+    last = None
+    for m in modes:
+        req = dict(request)
+        req["type_filling"] = int(m)
+        res = mt5.order_send(req)
+        last = res
+        if res is not None and res.retcode == mt5.TRADE_RETCODE_DONE:
+            return res
+        time.sleep(0.12)
+    return last
 
 
 def _modify_sl_only(position, new_sl: float, deviation: int = DEFAULT_DEVIATION) -> bool:
@@ -128,7 +148,6 @@ def _modify_sl_only(position, new_sl: float, deviation: int = DEFAULT_DEVIATION)
         print(f"❌ [PM] symbol_select failed for {symbol}. MT5 ERROR: {mt5.last_error()}")
         return False
 
-    # keep TP as-is
     tp_val = float(position.tp) if float(position.tp or 0) > 0 else 0.0
 
     request = {
@@ -139,10 +158,10 @@ def _modify_sl_only(position, new_sl: float, deviation: int = DEFAULT_DEVIATION)
         "tp": tp_val,
         "magic": int(getattr(position, "magic", 0) or 0),
         "deviation": int(deviation),
-        "comment": "profit_lock_1to2_at_1to3",
+        "comment": f"profit_lock_{LOCK_RR:.1f}R_at_{TRIGGER_RR:.1f}R",
     }
 
-    result = mt5.order_send(request)
+    result = _order_send_sltp_with_fill_fallback(request)
     if result is None:
         print(f"❌ [PM] SLTP modify None for {symbol}. MT5 ERROR: {mt5.last_error()}")
         return False
@@ -167,7 +186,6 @@ def _load_cursor() -> Dict[str, Any]:
     - seen_deals (small set-like dict) for de-dup
     """
     if not os.path.exists(CURSOR_FILE):
-        # default: look back 24 hours at first run
         now = int(time.time())
         return {"last_time": now - 24 * 3600, "seen_deals": {}}
 
@@ -193,9 +211,18 @@ def _save_cursor(data: Dict[str, Any]):
 
 
 def _deal_time_to_str(ts: int) -> str:
-    # show UTC for consistency
     dt = datetime.fromtimestamp(ts, tz=timezone.utc)
     return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _safe_get_account_tag() -> str:
+    acc = mt5.account_info()
+    if acc is None:
+        return ""
+    try:
+        return f"Login: {acc.login} | Server: {acc.server}"
+    except Exception:
+        return ""
 
 
 def notify_closed_positions(magic: int = DEFAULT_MAGIC):
@@ -207,13 +234,11 @@ def notify_closed_positions(magic: int = DEFAULT_MAGIC):
     last_time = int(cursor.get("last_time", int(time.time()) - 24 * 3600))
     seen = cursor.get("seen_deals", {}) or {}
 
-    # query from last_time - small overlap (in case of clock drift)
     time_from = datetime.fromtimestamp(max(0, last_time - 60), tz=timezone.utc)
     time_to = datetime.now(timezone.utc) + timedelta(seconds=5)
 
     deals = mt5.history_deals_get(time_from, time_to)
     if deals is None:
-        # if MT5 not connected, just skip gracefully
         return
 
     deals = list(deals)
@@ -221,6 +246,7 @@ def notify_closed_positions(magic: int = DEFAULT_MAGIC):
         return
 
     max_ts = last_time
+    acct = _safe_get_account_tag()
 
     for d in deals:
         try:
@@ -228,7 +254,6 @@ def notify_closed_positions(magic: int = DEFAULT_MAGIC):
             if deal_id <= 0:
                 continue
 
-            # dedupe
             if str(deal_id) in seen:
                 continue
 
@@ -236,7 +261,6 @@ def notify_closed_positions(magic: int = DEFAULT_MAGIC):
             if int(d_magic) != int(magic):
                 continue
 
-            # only OUT deals (closed)
             entry = int(getattr(d, "entry", -1))
             if entry != mt5.DEAL_ENTRY_OUT:
                 continue
@@ -250,13 +274,12 @@ def notify_closed_positions(magic: int = DEFAULT_MAGIC):
             if ts > max_ts:
                 max_ts = ts
 
-            # mark seen
             seen[str(deal_id)] = 1
 
-            # Build message
             pnl_emoji = "✅" if profit >= 0 else "❌"
             msg = (
                 f"{pnl_emoji} POSITION CLOSED\n"
+                f"{acct}\n"
                 f"Symbol: {symbol}\n"
                 f"Volume: {volume}\n"
                 f"PnL: {profit:.2f}\n"
@@ -270,9 +293,7 @@ def notify_closed_positions(magic: int = DEFAULT_MAGIC):
         except Exception:
             continue
 
-    # keep seen small
     if len(seen) > 2000:
-        # drop old entries by resetting
         seen = {}
 
     cursor["last_time"] = max_ts if max_ts > 0 else int(time.time())
@@ -301,6 +322,7 @@ def notify_open_positions_snapshot(magic: int = DEFAULT_MAGIC):
         _last_snapshot_ts = now
         return
 
+    acct = _safe_get_account_tag()
     lines = []
     for p in bot_pos:
         symbol = str(p.symbol)
@@ -308,7 +330,7 @@ def notify_open_positions_snapshot(magic: int = DEFAULT_MAGIC):
         profit = float(p.profit or 0.0)
         lines.append(f"{symbol} {typ} | vol={p.volume} | pnl={profit:.2f} | ticket={p.ticket}")
 
-    msg = "📌 OPEN POSITIONS SNAPSHOT\n" + "\n".join(lines[:15])
+    msg = "📌 OPEN POSITIONS SNAPSHOT\n" + (acct + "\n" if acct else "") + "\n".join(lines[:15])
     send_telegram(msg)
     _last_snapshot_ts = now
 
@@ -320,10 +342,11 @@ def manage_open_positions(magic: int = DEFAULT_MAGIC):
     """
     ✅ No 1H lock.
     - Sends close notifications (PnL) using history deals
-    - Applies profit lock: at 1:3RR, SL -> lock 1:2RR
+    - Applies profit lock:
+        RR reached >= TRIGGER_RR -> SL moves to LOCK_RR
     - Sends Telegram when SL is adjusted
     """
-    # 1) Notify closes first (so you get closure alerts ASAP)
+    # 1) Notify closes first
     try:
         notify_closed_positions(magic=magic)
     except Exception:
@@ -345,6 +368,8 @@ def manage_open_positions(magic: int = DEFAULT_MAGIC):
     if not positions:
         return
 
+    acct = _safe_get_account_tag()
+
     for p in positions:
         try:
             if int(getattr(p, "magic", 0) or 0) != int(magic):
@@ -354,7 +379,7 @@ def manage_open_positions(magic: int = DEFAULT_MAGIC):
             entry = float(p.price_open)
             current_sl = float(p.sl or 0.0)
 
-            # If SL missing, skip (can't compute RR safely)
+            # If SL missing, skip
             if current_sl <= 0:
                 continue
 
@@ -373,7 +398,7 @@ def manage_open_positions(magic: int = DEFAULT_MAGIC):
             if desired_sl is None:
                 continue
 
-            # Only tighten, never loosen
+            # Only tighten
             if not _only_tighten(current_sl, desired_sl, p.type):
                 continue
 
@@ -390,9 +415,10 @@ def manage_open_positions(magic: int = DEFAULT_MAGIC):
 
                 msg = (
                     f"🔒 SL ADJUSTED (Profit Lock)\n"
+                    f"{acct}\n"
                     f"Symbol: {symbol}\n"
                     f"Ticket: {p.ticket}\n"
-                    f"RR reached: ≥ {TRIGGER_RR:.1f}\n"
+                    f"RR reached: ≥ {TRIGGER_RR:.1f}R\n"
                     f"New SL: {final_sl}\n"
                     f"Locked: ~{LOCK_RR:.1f}R\n"
                 )

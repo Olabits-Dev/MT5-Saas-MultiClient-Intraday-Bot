@@ -1,0 +1,31 @@
+# Environment secrets
+.env
+
+# Client encrypted data
+clients.enc
+
+# Virtual environments
+myenv/
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+logs/
+*.log
+
+# Runtime state
+dd_state/
+
+# IDE files
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
