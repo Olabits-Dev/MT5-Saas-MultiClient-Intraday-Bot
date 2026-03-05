@@ -3,6 +3,8 @@
 
 # Client encrypted data
 clients.enc
+encrypt_client.py
+decrypt_clients.py
 
 # Virtual environments
 myenv/
